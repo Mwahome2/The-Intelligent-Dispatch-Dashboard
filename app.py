@@ -11,18 +11,18 @@ loaded_model = None
 label_encoders = {}
 try:
     # Load the model
-    model_path = '/content/DecisionTree_model.pkl'
+    model_path = 'DecisionTree_model.pkl'
     loaded_model = joblib.load(model_path)
     st.write(f"Loaded model from: {model_path}")
 
     # Load all the saved label encoders
-    label_encoders['Gender'] = joblib.load('/content/Gender_encoder.pkl')
-    label_encoders['Location/Ward/Village'] = joblib.load('/content/location_encoder.pkl')
-    label_encoders['Diagnoses'] = joblib.load('/content/Diagnoses_encoder.pkl')
-    label_encoders['Investigation titles'] = joblib.load('/content/Titles_encoder.pkl')
-    label_encoders['Investigation tests'] = joblib.load('/content/Tests_encoder.pkl')
-    label_encoders['Investigation test results'] = joblib.load('/content/TestResults_encoder.pkl')
-    label_encoders['Case Priority'] = joblib.load('/content/Case_encoder.pkl')
+    label_encoders['Gender'] = joblib.load('Gender_encoder.pkl')
+    label_encoders['Location/Ward/Village'] = joblib.load('location_encoder.pkl')
+    label_encoders['Diagnoses'] = joblib.load('Diagnoses_encoder.pkl')
+    label_encoders['Investigation titles'] = joblib.load('Titles_encoder.pkl')
+    label_encoders['Investigation tests'] = joblib.load('Tests_encoder.pkl')
+    label_encoders['Investigation test results'] = joblib.load('TestResults_encoder.pkl')
+    label_encoders['Case Priority'] = joblib.load('Case_encoder.pkl')
 
     st.success("Machine learning model and label encoders loaded successfully. ✅")
 except FileNotFoundError as e:
@@ -173,6 +173,7 @@ def main():
                         request['status'] = "Completed"
                         st.rerun()
             st.markdown("---")
+
 
 # Run the main function
 if __name__ == '__main__':

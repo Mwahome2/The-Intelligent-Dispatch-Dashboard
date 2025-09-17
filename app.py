@@ -42,12 +42,12 @@ def predict_priority(input_data):
         processed_input.append(label_encoders['Gender'].transform([input_data['Gender']])[0])
         processed_input.append(input_data['Age'])
 
-        # Handle cases where user enters a new value not in training data
+        # Handle unseen/new values
         def safe_transform(encoder, value):
             if value in encoder.classes_:
                 return encoder.transform([value])[0]
             else:
-                return 0  # fallback
+                return 0  # fallback to first class
 
         processed_input.append(safe_transform(label_encoders['Location/Ward/Village'], input_data['Location/Ward/Village']))
         processed_input.append(safe_transform(label_encoders['Diagnoses'], input_data['Diagnoses']))
@@ -169,14 +169,15 @@ def main():
                             mark_ambulance_status(amb, "busy")
                             st.experimental_rerun()
                     else:
-                        st.warning("No ambulances available")
+                        st.warning("⚠️ No ambulances available")
 
                 elif r['status'] == "Dispatched":
                     st.write(f"🚑 Assigned Ambulance: {r['ambulance']}")
                     for a in st.session_state.ambulances:
                         formatted = f"{a['plate']} - {a['driver']} ({a['phone']})"
                         if formatted == r['ambulance']:
-                            st.write(f"📞 Driver Contact: [{a['phone']}](tel:{a['phone']})")
+                            st.write(f"👨‍✈️ Driver: {a['driver']}")
+                            st.write(f"📞 Contact: [{a['phone']}](tel:{a['phone']})")
                             break
 
                     if st.button("Complete", key=f"complete_{r['id']}"):
@@ -187,16 +188,28 @@ def main():
                 st.markdown("---")
 
     # ----------------------------
-    # Ambulances
+    # Ambulance Dashboard
     # ----------------------------
     elif nav == "Ambulances":
         st.header("3. Ambulance Dashboard")
-        df = pd.DataFrame(st.session_state.ambulances)
-        st.dataframe(df)
+        st.dataframe(pd.DataFrame(st.session_state.ambulances))
+
+        with st.expander("➕ Add New Ambulance"):
+            plate = st.text_input("Plate Number")
+            driver = st.text_input("Driver Name")
+            phone = st.text_input("Driver Phone")
+            if st.button("Add Ambulance"):
+                if plate and driver and phone:
+                    st.session_state.ambulances.append(
+                        {"plate": plate, "driver": driver, "phone": phone, "status": "available"}
+                    )
+                    st.success("🚑 Ambulance added successfully")
 
 # ----------------------------
 # Run App
 # ----------------------------
 if __name__ == '__main__':
     main()
+
+
 

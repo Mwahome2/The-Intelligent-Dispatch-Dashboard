@@ -1,4 +1,3 @@
-# app.py - Intelligent Dispatch Dashboard (accepts both known + new patient data)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,16 +7,15 @@ import uuid
 from sklearn.preprocessing import LabelEncoder
 
 # ----------------------------
-# 1) Load ML model + encoders
+# Load Model & Label Encoders
 # ----------------------------
 loaded_model = None
 label_encoders = {}
-
 try:
     model_path = 'DecisionTree_model.pkl'
     loaded_model = joblib.load(model_path)
+    st.write(f"Loaded model from: {model_path}")
 
-    # load encoders
     label_encoders['Gender'] = joblib.load('Gender_encoder.pkl')
     label_encoders['Location/Ward/Village'] = joblib.load('location_encoder.pkl')
     label_encoders['Diagnoses'] = joblib.load('Diagnoses_encoder.pkl')
@@ -26,241 +24,179 @@ try:
     label_encoders['Investigation test results'] = joblib.load('TestResults_encoder.pkl')
     label_encoders['Case Priority'] = joblib.load('Case_encoder.pkl')
 
-    st.success("✅ ML model and encoders loaded successfully")
+    st.success("✅ Model and encoders loaded successfully")
 except FileNotFoundError as e:
-    st.error(f"❌ Missing file: {e}")
+    st.error(f"Missing file: {e}. Please run training first.")
     st.stop()
 except Exception as e:
-    st.error(f"⚠️ Unexpected error loading model/encoders: {e}")
+    st.error(f"Unexpected error loading assets: {e}")
     st.stop()
 
 # ----------------------------
-# 2) Prediction function
+# Prediction Function
 # ----------------------------
-def safe_encode(encoder, value):
-    """Try encoding a value; if unseen, return None"""
-    try:
-        return encoder.transform([value])[0]
-    except ValueError:
-        return None
-
 def predict_priority(input_data):
     try:
         processed_input = []
-        visit_dt = pd.to_datetime(input_data['Visit date'])
-        processed_input.append(visit_dt.timestamp())
+        processed_input.append(pd.to_datetime(input_data['Visit date']).timestamp())
+        processed_input.append(label_encoders['Gender'].transform([input_data['Gender']])[0])
+        processed_input.append(input_data['Age'])
 
-        g = safe_encode(label_encoders['Gender'], input_data['Gender'])
-        loc = safe_encode(label_encoders['Location/Ward/Village'], input_data['Location/Ward/Village'])
-        diag = safe_encode(label_encoders['Diagnoses'], input_data['Diagnoses'])
-        title = safe_encode(label_encoders['Investigation titles'], input_data['Investigation titles'])
-        test = safe_encode(label_encoders['Investigation tests'], input_data['Investigation tests'])
-        result = safe_encode(label_encoders['Investigation test results'], input_data['Investigation test results'])
+        # Handle cases where user enters a new value not in training data
+        def safe_transform(encoder, value):
+            if value in encoder.classes_:
+                return encoder.transform([value])[0]
+            else:
+                return 0  # fallback
 
-        processed_input.extend([g if g is not None else 0,
-                                int(input_data['Age']),
-                                loc if loc is not None else 0,
-                                diag if diag is not None else 0,
-                                title if title is not None else 0,
-                                test if test is not None else 0,
-                                result if result is not None else 0])
+        processed_input.append(safe_transform(label_encoders['Location/Ward/Village'], input_data['Location/Ward/Village']))
+        processed_input.append(safe_transform(label_encoders['Diagnoses'], input_data['Diagnoses']))
+        processed_input.append(safe_transform(label_encoders['Investigation titles'], input_data['Investigation titles']))
+        processed_input.append(safe_transform(label_encoders['Investigation tests'], input_data['Investigation tests']))
+        processed_input.append(safe_transform(label_encoders['Investigation test results'], input_data['Investigation test results']))
 
-        if None in [g, loc, diag, title, test, result]:
-            return "Unknown Priority"
-
-        arr = np.asarray(processed_input).reshape(1, -1)
-        pred_num = loaded_model.predict(arr)[0]
-        pred_label = label_encoders['Case Priority'].inverse_transform([pred_num])[0]
-        return pred_label
+        input_data_reshaped = np.asarray(processed_input).reshape(1, -1)
+        numerical_prediction = loaded_model.predict(input_data_reshaped)[0]
+        predicted_priority = label_encoders['Case Priority'].inverse_transform([numerical_prediction])[0]
+        return predicted_priority
     except Exception as e:
         st.error(f"Prediction error: {e}")
         return "Unknown Priority"
 
 # ----------------------------
-# 3) App Initialization
+# Ambulance Management
 # ----------------------------
-st.set_page_config(page_title="Intelligent Dispatch Dashboard", layout="wide", page_icon="🚑")
-
-if 'requests' not in st.session_state:
-    st.session_state.requests = []
 if 'ambulances' not in st.session_state:
-    st.session_state.ambulances = []
-
-# ----------------------------
-# 4) Ambulance helpers
-# ----------------------------
-def add_ambulance(plate, driver):
-    new_amb = {"id": str(uuid.uuid4()), "plate": plate.strip(), "driver": driver.strip(), "status": "available"}
-    st.session_state.ambulances.append(new_amb)
-    return new_amb
+    st.session_state.ambulances = [
+        {"plate": "KDA 123A", "driver": "John Doe", "phone": "+254700111222", "status": "available"},
+        {"plate": "KDB 456B", "driver": "Jane Smith", "phone": "+254733444555", "status": "available"},
+        {"plate": "KDC 789C", "driver": "Ali Hassan", "phone": "+254722666777", "status": "available"}
+    ]
 
 def get_available_ambulances():
-    return [f"{a['plate']} - {a['driver']}" for a in st.session_state.ambulances if a['status'] == "available"]
+    return [f"{a['plate']} - {a['driver']} ({a['phone']})" for a in st.session_state.ambulances if a['status'] == "available"]
 
-def mark_ambulance_status(display, new_status):
+def mark_ambulance_status(plate, status):
     for a in st.session_state.ambulances:
-        if f"{a['plate']} - {a['driver']}" == display:
-            a['status'] = new_status
-            return True
-    return False
+        if plate.startswith(a['plate']):
+            a['status'] = status
 
 # ----------------------------
-# 5) App Navigation
+# Main Streamlit App
 # ----------------------------
-st.title("🚑 Intelligent Dispatch Dashboard")
-nav = st.sidebar.radio("Navigation", ["Home", "Incoming Requests", "Dispatch Board", "Ambulance Dashboard", "About"])
+def main():
+    st.set_page_config(page_title="Intelligent Dispatch Dashboard", layout="wide")
+    st.title("🚑 Intelligent Dispatch Dashboard")
+    st.markdown("---")
 
-# ----------------------------
-# Home
-# ----------------------------
-if nav == "Home":
-    st.header("Welcome")
-    st.write("Manage patient requests, predict priority, and assign to ambulances + drivers.")
-    total = len(st.session_state.requests)
-    pending = sum(r['status']=="Pending" for r in st.session_state.requests)
-    dispatched = sum(r['status']=="Dispatched" for r in st.session_state.requests)
-    completed = sum(r['status']=="Completed" for r in st.session_state.requests)
-    amb_total = len(st.session_state.ambulances)
-    amb_avail = sum(a['status']=="available" for a in st.session_state.ambulances)
+    if 'requests' not in st.session_state:
+        st.session_state.requests = []
 
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Total Requests", total)
-    c2.metric("Pending", pending)
-    c3.metric("Dispatched", dispatched)
-    c4.metric("Completed", completed)
-    c5.metric("Ambulances Available", amb_avail)
+    nav = st.sidebar.radio("Navigation", ["Incoming Requests", "Dispatch Board", "Ambulances"])
 
-# ----------------------------
-# Incoming Requests
-# ----------------------------
-elif nav == "Incoming Requests":
-    st.header("Incoming Requests")
-    with st.form("new_request_form", clear_on_submit=True):
-        col1,col2 = st.columns(2)
-        with col1:
-            patient_name = st.text_input("Patient Name")
-            patient_gender = st.selectbox("Gender", ['M','F','Other'])
-            patient_age = st.number_input("Age", 0, 120, 30)
-            patient_visit_date = st.date_input("Visit Date", datetime.date.today())
-        with col2:
-            # Known + Other for new values
-            loc_choice = st.selectbox("Location/Ward/Village",
-                list(label_encoders['Location/Ward/Village'].classes_) + ["Other"])
-            if loc_choice=="Other":
-                patient_location = st.text_input("Enter Location")
-            else:
-                patient_location = loc_choice
+    # ----------------------------
+    # Incoming Requests
+    # ----------------------------
+    if nav == "Incoming Requests":
+        st.header("1. Incoming Requests")
+        with st.expander("Submit a New Request"):
+            with st.form("new_request_form", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    patient_name = st.text_input("Patient Name")
+                    patient_gender = st.selectbox("Gender", ['M', 'F'])
+                    patient_age = st.number_input("Patient Age (years)", min_value=0, max_value=120, value=30)
+                    patient_visit_date = st.date_input("Visit Date", datetime.date.today())
+                with col2:
+                    patient_location = st.text_input("Patient Location/Ward/Village")
+                    patient_diagnosis = st.text_input("Diagnosis")
+                    patient_investigation_titles = st.text_input("Investigation Title")
+                    patient_investigation_tests = st.text_input("Investigation Test")
+                    patient_investigation_test_results = st.text_input("Investigation Test Results")
 
-            diag_choice = st.selectbox("Diagnosis",
-                list(label_encoders['Diagnoses'].classes_) + ["Other"])
-            if diag_choice=="Other":
-                patient_diagnosis = st.text_input("Enter Diagnosis")
-            else:
-                patient_diagnosis = diag_choice
+                submitted = st.form_submit_button("Submit Request")
 
-            title_choice = st.selectbox("Investigation Title",
-                list(label_encoders['Investigation titles'].classes_) + ["Other"])
-            patient_investigation_titles = st.text_input("Enter Title") if title_choice=="Other" else title_choice
+                if submitted:
+                    input_data = {
+                        'Visit date': patient_visit_date,
+                        'Gender': patient_gender,
+                        'Age': patient_age,
+                        'Location/Ward/Village': patient_location,
+                        'Diagnoses': patient_diagnosis,
+                        'Investigation titles': patient_investigation_titles,
+                        'Investigation tests': patient_investigation_tests,
+                        'Investigation test results': patient_investigation_test_results
+                    }
+                    priority = predict_priority(input_data)
 
-            test_choice = st.selectbox("Investigation Test",
-                list(label_encoders['Investigation tests'].classes_) + ["Other"])
-            patient_investigation_tests = st.text_input("Enter Test") if test_choice=="Other" else test_choice
+                    new_request = {
+                        "id": str(uuid.uuid4()),
+                        "patient_name": patient_name,
+                        "patient_age": patient_age,
+                        "patient_location": patient_location,
+                        "patient_diagnosis": patient_diagnosis,
+                        "priority": priority,
+                        "status": "Pending"
+                    }
+                    st.session_state.requests.append(new_request)
+                    st.success(f"✅ Request for {patient_name} submitted with '{priority}' priority!")
 
-            result_choice = st.selectbox("Investigation Result",
-                list(label_encoders['Investigation test results'].classes_) + ["Other"])
-            patient_investigation_test_results = st.text_input("Enter Result") if result_choice=="Other" else result_choice
+    # ----------------------------
+    # Dispatch Board
+    # ----------------------------
+    elif nav == "Dispatch Board":
+        st.header("2. Dispatch Board")
+        if not st.session_state.requests:
+            st.info("No active requests.")
+        else:
+            priority_order = {"High Priority": 0, "Medium Priority": 1, "Low Priority": 2, "Unknown Priority": 3}
+            sorted_requests = sorted(st.session_state.requests, key=lambda x: priority_order.get(x['priority'], 4))
 
-        submitted = st.form_submit_button("Submit Request")
-        if submitted:
-            input_data = {
-                "Visit date": patient_visit_date,
-                "Gender": patient_gender,
-                "Age": patient_age,
-                "Location/Ward/Village": patient_location,
-                "Diagnoses": patient_diagnosis,
-                "Investigation titles": patient_investigation_titles,
-                "Investigation tests": patient_investigation_tests,
-                "Investigation test results": patient_investigation_test_results
-            }
-            priority = predict_priority(input_data)
-            new_req = {
-                "id": str(uuid.uuid4()),
-                "patient_name": patient_name or "Unknown",
-                "patient_age": int(patient_age),
-                "patient_location": patient_location,
-                "patient_diagnosis": patient_diagnosis,
-                "priority": priority,
-                "status": "Pending",
-                "ambulance": None
-            }
-            st.session_state.requests.append(new_req)
-            st.success(f"Added request for {new_req['patient_name']} with priority {priority}")
+            for r in sorted_requests:
+                cols = st.columns([2,2,2,2])
+                cols[0].write(f"**{r['patient_name']}** ({r['patient_age']} yrs)")
+                cols[1].write(f"Diagnosis: {r['patient_diagnosis']}")
+                cols[2].write(f"Priority: {r['priority']}")
+                cols[3].write(f"Status: {r['status']}")
 
-    if st.session_state.requests:
-        st.subheader("All Requests")
-        st.dataframe(pd.DataFrame(st.session_state.requests), use_container_width=True)
+                if r['status'] == "Pending":
+                    available = get_available_ambulances()
+                    if available:
+                        amb = st.selectbox("Assign Ambulance", available, key=f"amb_{r['id']}")
+                        if st.button("Dispatch", key=f"dispatch_{r['id']}"):
+                            r['status'] = "Dispatched"
+                            r['ambulance'] = amb
+                            mark_ambulance_status(amb, "busy")
+                            st.experimental_rerun()
+                    else:
+                        st.warning("No ambulances available")
 
-# ----------------------------
-# Dispatch Board
-# ----------------------------
-elif nav == "Dispatch Board":
-    st.header("Dispatch Board")
-    if not st.session_state.requests:
-        st.info("No requests yet")
-    else:
-        for r in st.session_state.requests:
-            cols = st.columns([2,2,2,2])
-            cols[0].write(f"**{r['patient_name']}** ({r['patient_age']} yrs)")
-            cols[1].write(f"Diagnosis: {r['patient_diagnosis']}")
-            cols[2].write(f"Priority: {r['priority']}")
-            cols[3].write(f"Status: {r['status']}")
-            if r['status']=="Pending":
-                available = get_available_ambulances()
-                if available:
-                    amb = st.selectbox("Assign Ambulance", available, key=f"amb_{r['id']}")
-                    if st.button("Dispatch", key=f"dispatch_{r['id']}"):
-                        r['status']="Dispatched"
-                        r['ambulance']=amb
-                        mark_ambulance_status(amb,"busy")
+                elif r['status'] == "Dispatched":
+                    st.write(f"🚑 Assigned Ambulance: {r['ambulance']}")
+                    for a in st.session_state.ambulances:
+                        formatted = f"{a['plate']} - {a['driver']} ({a['phone']})"
+                        if formatted == r['ambulance']:
+                            st.write(f"📞 Driver Contact: [{a['phone']}](tel:{a['phone']})")
+                            break
+
+                    if st.button("Complete", key=f"complete_{r['id']}"):
+                        r['status'] = "Completed"
+                        mark_ambulance_status(r['ambulance'], "available")
                         st.experimental_rerun()
-                else:
-                    st.warning("No ambulances available")
-            elif r['status']=="Dispatched":
-                st.write(f"🚑 {r['ambulance']}")
-                if st.button("Complete", key=f"complete_{r['id']}"):
-                    r['status']="Completed"
-                    mark_ambulance_status(r['ambulance'],"available")
-                    st.experimental_rerun()
-            st.markdown("---")
+
+                st.markdown("---")
+
+    # ----------------------------
+    # Ambulances
+    # ----------------------------
+    elif nav == "Ambulances":
+        st.header("3. Ambulance Dashboard")
+        df = pd.DataFrame(st.session_state.ambulances)
+        st.dataframe(df)
 
 # ----------------------------
-# Ambulance Dashboard
+# Run App
 # ----------------------------
-elif nav == "Ambulance Dashboard":
-    st.header("Ambulance Dashboard")
-    with st.form("add_amb", clear_on_submit=True):
-        plate = st.text_input("Plate Number")
-        driver = st.text_input("Driver Name")
-        if st.form_submit_button("Add Ambulance"):
-            if plate and driver:
-                add_ambulance(plate,driver)
-                st.success("Ambulance added")
-    if st.session_state.ambulances:
-        st.dataframe(pd.DataFrame(st.session_state.ambulances), use_container_width=True)
+if __name__ == '__main__':
+    main()
 
-# ----------------------------
-# About
-# ----------------------------
-elif nav == "About":
-    st.header("About")
-    st.write("""
-    - Predicts patient priority (if values match training data).  
-    - Accepts **new patients with unseen values** (priority becomes 'Unknown Priority').  
-    - Assigns requests to **specific ambulances + drivers**.  
-    - Tracks ambulance availability.  
-    """)
-
-
-# ----------------------------
-# End
-# ----------------------------

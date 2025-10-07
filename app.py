@@ -62,7 +62,7 @@ def init_db():
             FOREIGN KEY(ambulance_id) REFERENCES ambulances(id)
         )
     """)
-    # dispatch_logs table (centralized dispatch log)
+    # dispatch_logs table (centralized dispatch log) - added dispatch_location (text-only)
     c.execute("""
         CREATE TABLE IF NOT EXISTS dispatch_logs (
             id TEXT PRIMARY KEY,
@@ -70,6 +70,7 @@ def init_db():
             caller_phone TEXT,
             request_location TEXT,
             request_reason TEXT,
+            dispatch_location TEXT,
             request_id TEXT,
             vehicle_id TEXT,
             status TEXT,
@@ -223,15 +224,19 @@ def list_requests_df():
     return pd.read_sql("SELECT r.*, a.plate AS amb_plate, a.driver AS amb_driver, a.phone AS amb_phone FROM requests r LEFT JOIN ambulances a ON r.ambulance_id=a.id ORDER BY created_at DESC", conn)
 
 # Dispatch log helpers
-def add_dispatch_log(caller: str, caller_phone: str, request_location: str, request_reason: str, request_id: Optional[str], vehicle_id: Optional[str], status: str = "Requested"):
+def add_dispatch_log(caller: str, caller_phone: str, request_location: str, request_reason: str,
+                     dispatch_location: str, request_id: Optional[str], vehicle_id: Optional[str], status: str = "Requested"):
+    """Insert a dispatch log including text-only dispatch_location."""
     did = str(uuid.uuid4())
     now = datetime.datetime.now().isoformat()
     requested_at = now
     c = conn.cursor()
     c.execute("""
-        INSERT INTO dispatch_logs (id, caller, caller_phone, request_location, request_reason, request_id, vehicle_id, status, requested_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (did, caller, caller_phone, request_location, request_reason, request_id, vehicle_id, status, requested_at, now))
+        INSERT INTO dispatch_logs (id, caller, caller_phone, request_location, request_reason,
+                                   dispatch_location, request_id, vehicle_id, status, requested_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (did, caller, caller_phone, request_location, request_reason, dispatch_location,
+          request_id, vehicle_id, status, requested_at, now))
     conn.commit()
     return did
 
@@ -267,12 +272,13 @@ def update_dispatch_status(did: str, new_status: str):
                 pass
     conn.commit()
 
-def assign_vehicle_and_create_dispatch(request_id: str, vehicle_id: str, caller: str = "", caller_phone: str = "", reason: str = ""):
+def assign_vehicle_and_create_dispatch(request_id: str, vehicle_id: str, caller: str = "", caller_phone: str = "", reason: str = "", dispatch_location: str = ""):
     # update request and ambulance
     update_request_db_ambulance(request_id, vehicle_id, "Dispatched")
     set_ambulance_status_db(vehicle_id, "busy")
-    # create dispatch log linking to request
-    did = add_dispatch_log(caller, caller_phone, request_location="", request_reason=reason, request_id=request_id, vehicle_id=vehicle_id, status="Dispatched")
+    # create dispatch log linking to request (stores dispatch_location)
+    did = add_dispatch_log(caller, caller_phone, request_location="", request_reason=reason,
+                           dispatch_location=dispatch_location, request_id=request_id, vehicle_id=vehicle_id, status="Dispatched")
     # set dispatched_at immediately
     update_dispatch_status(did, "Dispatched")
     return did
@@ -488,11 +494,14 @@ elif menu == "Dispatch Board":
                     caller = st.text_input("Caller name (optional)")
                     caller_phone = st.text_input("Caller phone (optional)")
                     reason = st.text_input("Reason / notes (optional)")
+                    # NEW: text-only dispatch location input
+                    dispatch_location = st.text_input("Dispatch location (text only, e.g., Ahero, Kisumu Central)")
+
                     if chosen_display and chosen_display != "(choose)":
                         if st.button("Dispatch to chosen ambulance"):
                             ambulance_id = amb_display_map[chosen_display]
-                            # create dispatch + update
-                            did = assign_vehicle_and_create_dispatch(sel_req_id, ambulance_id, caller=caller, caller_phone=caller_phone, reason=reason)
+                            # create dispatch + update (includes dispatch_location)
+                            did = assign_vehicle_and_create_dispatch(sel_req_id, ambulance_id, caller=caller, caller_phone=caller_phone, reason=reason, dispatch_location=dispatch_location)
                             st.success(f"Dispatched {row['patient_name']} -> {chosen_display} (Dispatch ID: {did})")
                             st.rerun()
 
@@ -515,7 +524,7 @@ elif menu == "Dispatch Board":
                     if logs:
                         update_dispatch_status(logs[0][0], "Completed")
                     st.success("Marked Completed")
-                    st.experimental_rerun()
+                    st.rerun()
             elif row["status"] == "Completed":
                 st.success("Request already completed.")
 
@@ -536,7 +545,7 @@ elif menu == "Dispatch Board":
                 if new_status == "Completed" and pd.notna(drow.get('vehicle_id')):
                     set_ambulance_status_db(drow['vehicle_id'], 'available')
                 st.success("Dispatch status updated")
-                st.experimental_rerun()
+                st.rerun()
 
 # ---------- DISPATCH LOG (History / Filters / Export / Analytics) ----------
 elif menu == "Dispatch Log":
@@ -560,7 +569,10 @@ elif menu == "Dispatch Log":
             df_filtered = df_filtered[df_filtered['status']==status_filter]
 
         st.subheader("Filtered dispatch logs")
-        st.dataframe(df_filtered, use_container_width=True)
+        # show key columns including dispatch_location
+        show_cols = ["id","vehicle_plate","vehicle_driver","dispatch_location","request_reason","status","requested_at","dispatched_at","completed_at"]
+        available_cols = [c for c in show_cols if c in df_filtered.columns]
+        st.dataframe(df_filtered[available_cols], use_container_width=True)
 
         # Export options
         st.markdown("---")
@@ -644,11 +656,11 @@ elif menu == "Ambulance Dashboard":
             if st.button("Update ambulance"):
                 update_ambulance_db(selected_amb, plate_new, driver_new, phone_new, status_new)
                 st.success("Ambulance updated")
-                st.experimental_rerun()
+                st.rerun()
             if st.button("Delete ambulance"):
                 delete_ambulance_db(selected_amb)
                 st.success("Ambulance deleted")
-                st.experimental_rerun()
+                st.rerun()
 
 # ---------- ABOUT ----------
 elif menu == "About":
@@ -667,11 +679,13 @@ elif menu == "About":
     - Automatic computation of response-time KPIs and simple utilization metrics (trips per vehicle, avg response time).
     - History filtering by date range, vehicle and status for audits and analysis.
     - Export dispatch summaries as CSV or Excel for offline reporting.
+    - **Dispatch location (text-only)**: record textual dispatch place (e.g., 'Ahero', 'Kisumu Central') for each dispatch.
     """)
 
 # ---------------------------
 # End
 # ---------------------------
+
 
 
     

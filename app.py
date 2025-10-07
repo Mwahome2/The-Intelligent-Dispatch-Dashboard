@@ -494,7 +494,8 @@ elif menu == "Dispatch Board":
                             # create dispatch + update
                             did = assign_vehicle_and_create_dispatch(sel_req_id, ambulance_id, caller=caller, caller_phone=caller_phone, reason=reason)
                             st.success(f"Dispatched {row['patient_name']} -> {chosen_display} (Dispatch ID: {did})")
-                            st.experimental_rerun()
+                           st.rerun()
+
             elif row["status"] == "Dispatched":
                 st.info("This request is already dispatched.")
                 if pd.notna(row["amb_plate"]):

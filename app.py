@@ -14,7 +14,7 @@ import io
 # CONFIG / DB
 # ---------------------------
 # NOTE: using the DB filename you provided
-DB_PATH = "dispatch_kcrh.py"
+DB_PATH = "dispatch_kcrh.db"  # correct SQLite database file
 MODEL_FILE = "DecisionTree_model.pkl"
 # Encoder file names expected (adjust if your files are named differently)
 ENCODERS = {

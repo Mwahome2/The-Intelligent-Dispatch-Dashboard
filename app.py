@@ -8,6 +8,7 @@ import uuid
 import sqlite3
 import os
 from typing import Optional
+import io
 
 # ---------------------------
 # CONFIG / DB
@@ -59,6 +60,28 @@ def init_db():
             ambulance_id TEXT,
             created_at TEXT,
             FOREIGN KEY(ambulance_id) REFERENCES ambulances(id)
+        )
+    """)
+    # dispatch_logs table (centralized dispatch log)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS dispatch_logs (
+            id TEXT PRIMARY KEY,
+            caller TEXT,
+            caller_phone TEXT,
+            request_location TEXT,
+            request_reason TEXT,
+            request_id TEXT,
+            vehicle_id TEXT,
+            status TEXT,
+            requested_at TEXT,
+            dispatched_at TEXT,
+            enroute_at TEXT,
+            at_scene_at TEXT,
+            completed_at TEXT,
+            response_time_seconds INTEGER,
+            created_at TEXT,
+            FOREIGN KEY(vehicle_id) REFERENCES ambulances(id),
+            FOREIGN KEY(request_id) REFERENCES requests(id)
         )
     """)
     conn.commit()
@@ -121,7 +144,7 @@ def predict_priority(input_data: dict) -> str:
     """
     try:
         # convert visit date to timestamp
-        visit_dt = pd.to_datetime(input_data["Visit date"])
+        visit_dt = pd.to_datetime(input_data["Visit date"]) 
         ts = visit_dt.timestamp()
 
         g = safe_encode(label_encoders["Gender"], input_data["Gender"])
@@ -199,21 +222,121 @@ def update_request_db_ambulance(rid: str, aid: Optional[str], status: str):
 def list_requests_df():
     return pd.read_sql("SELECT r.*, a.plate AS amb_plate, a.driver AS amb_driver, a.phone AS amb_phone FROM requests r LEFT JOIN ambulances a ON r.ambulance_id=a.id ORDER BY created_at DESC", conn)
 
+# Dispatch log helpers
+def add_dispatch_log(caller: str, caller_phone: str, request_location: str, request_reason: str, request_id: Optional[str], vehicle_id: Optional[str], status: str = "Requested"):
+    did = str(uuid.uuid4())
+    now = datetime.datetime.now().isoformat()
+    requested_at = now
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO dispatch_logs (id, caller, caller_phone, request_location, request_reason, request_id, vehicle_id, status, requested_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (did, caller, caller_phone, request_location, request_reason, request_id, vehicle_id, status, requested_at, now))
+    conn.commit()
+    return did
+
+def update_dispatch_status(did: str, new_status: str):
+    # set timestamp for the status if not already set
+    ts = datetime.datetime.now().isoformat()
+    c = conn.cursor()
+    col = None
+    if new_status == "Dispatched":
+        col = "dispatched_at"
+    elif new_status == "En route":
+        col = "enroute_at"
+    elif new_status == "At scene":
+        col = "at_scene_at"
+    elif new_status == "Completed":
+        col = "completed_at"
+    # update status and timestamp column
+    if col:
+        c.execute(f"UPDATE dispatch_logs SET status=?, {col}=? WHERE id=?", (new_status, ts, did))
+    else:
+        c.execute("UPDATE dispatch_logs SET status=? WHERE id=?", (new_status, did))
+    # if completed -> compute response_time_seconds (dispatched_at - requested_at)
+    if new_status == "Completed":
+        # fetch requested_at and dispatched_at
+        row = c.execute("SELECT requested_at, dispatched_at FROM dispatch_logs WHERE id=?", (did,)).fetchone()
+        if row and row[0] and row[1]:
+            try:
+                requested = pd.to_datetime(row[0])
+                dispatched = pd.to_datetime(row[1])
+                secs = int((dispatched - requested).total_seconds())
+                c.execute("UPDATE dispatch_logs SET response_time_seconds=? WHERE id=?", (secs, did))
+            except Exception:
+                pass
+    conn.commit()
+
+def assign_vehicle_and_create_dispatch(request_id: str, vehicle_id: str, caller: str = "", caller_phone: str = "", reason: str = ""):
+    # update request and ambulance
+    update_request_db_ambulance(request_id, vehicle_id, "Dispatched")
+    set_ambulance_status_db(vehicle_id, "busy")
+    # create dispatch log linking to request
+    did = add_dispatch_log(caller, caller_phone, request_location="", request_reason=reason, request_id=request_id, vehicle_id=vehicle_id, status="Dispatched")
+    # set dispatched_at immediately
+    update_dispatch_status(did, "Dispatched")
+    return did
+
+def list_dispatches_df():
+    return pd.read_sql("SELECT d.*, a.plate as vehicle_plate, a.driver as vehicle_driver, a.phone as vehicle_phone FROM dispatch_logs d LEFT JOIN ambulances a ON d.vehicle_id=a.id ORDER BY created_at DESC", conn)
+
+# ---------------------------
+# Analytics helpers
+# ---------------------------
+def compute_response_time_kpis(dispatches: pd.DataFrame):
+    df = dispatches.copy()
+    # ensure datetime
+    for col in ["requested_at", "dispatched_at", "enroute_at", "at_scene_at", "completed_at"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    # compute response_seconds when possible
+    df['response_seconds'] = (df['dispatched_at'] - df['requested_at']).dt.total_seconds()
+    overall_avg = df['response_seconds'].dropna().mean()
+    median = df['response_seconds'].dropna().median()
+    completed_count = df[df['status']=='Completed'].shape[0]
+    pending_count = df[df['status']!='Completed'].shape[0]
+    return {
+        'average_response_seconds': int(overall_avg) if not np.isnan(overall_avg) else None,
+        'median_response_seconds': int(median) if not np.isnan(median) else None,
+        'completed_count': int(completed_count),
+        'pending_count': int(pending_count)
+    }
+
+def utilization_metrics(dispatches: pd.DataFrame, period_start: Optional[pd.Timestamp]=None, period_end: Optional[pd.Timestamp]=None):
+    df = dispatches.copy()
+    df['requested_at'] = pd.to_datetime(df['requested_at'], errors='coerce')
+    if period_start is not None:
+        df = df[df['requested_at'] >= period_start]
+    if period_end is not None:
+        df = df[df['requested_at'] <= period_end]
+    # trips per vehicle
+    trips = df.groupby('vehicle_plate').size().reset_index(name='trips')
+    # average response per vehicle
+    df['dispatched_at'] = pd.to_datetime(df['dispatched_at'], errors='coerce')
+    df['response_seconds'] = (df['dispatched_at'] - df['requested_at']).dt.total_seconds()
+    avg_response = df.groupby('vehicle_plate')['response_seconds'].mean().reset_index(name='avg_response_seconds')
+    merged = trips.merge(avg_response, on='vehicle_plate', how='left')
+    return merged
+
 # ---------------------------
 # App UI
 # ---------------------------
 st.set_page_config(page_title="Intelligent Dispatch Dashboard", layout="wide", page_icon="🚑")
 st.title("🚑 Intelligent Dispatch Dashboard")
 
-menu = st.sidebar.radio("Menu", ["Home", "Incoming Request", "Dispatch Board", "Ambulance Dashboard", "About"])
+menu = st.sidebar.radio("Menu", ["Home", "Incoming Request", "Dispatch Board", "Ambulance Dashboard", "Dispatch Log", "About"])
 
 # ---------- HOME ----------
 if menu == "Home":
     st.header("Overview")
     reqs_df = list_requests_df()
     amb_df = list_ambulances_df()
+    disp_df = list_dispatches_df()
+
     st.metric("Total requests", len(reqs_df))
     st.metric("Total ambulances", len(amb_df))
+    st.metric("Total dispatches", len(disp_df))
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Recent requests")
@@ -221,6 +344,15 @@ if menu == "Home":
     with col2:
         st.subheader("Ambulance status")
         st.dataframe(amb_df)
+
+    st.markdown("---")
+    st.subheader("Quick KPIs")
+    kpis = compute_response_time_kpis(disp_df)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Avg response (s)", kpis.get('average_response_seconds') or "N/A")
+    k2.metric("Median response (s)", kpis.get('median_response_seconds') or "N/A")
+    k3.metric("Completed dispatches", kpis.get('completed_count'))
+    k4.metric("Pending dispatches", kpis.get('pending_count'))
 
 # ---------- INCOMING REQUEST ----------
 elif menu == "Incoming Request":
@@ -321,7 +453,7 @@ elif menu == "Incoming Request":
 
 # ---------- DISPATCH BOARD ----------
 elif menu == "Dispatch Board":
-    st.header("Dispatch Board - assign ambulance to request")
+    st.header("Dispatch Board - assign ambulance to request & quick dispatch actions")
 
     # Load requests and ambulances
     reqs_df = list_requests_df()
@@ -331,7 +463,7 @@ elif menu == "Dispatch Board":
         st.info("No requests yet.")
     else:
         # show a filter (optional)
-        status_filter = st.selectbox("Filter by status", ["All", "Pending", "Dispatched", "Completed"], index=0)
+        status_filter = st.selectbox("Filter by request status", ["All", "Pending", "Dispatched", "Completed"], index=0)
         display_df = reqs_df if status_filter == "All" else reqs_df[reqs_df["status"] == status_filter]
         st.dataframe(display_df[["id","patient_name","patient_age","patient_diagnosis","priority","status","amb_plate","amb_driver","amb_phone","created_at"]], use_container_width=True)
 
@@ -353,13 +485,15 @@ elif menu == "Dispatch Board":
                     # show display string for each ambulance
                     amb_display_map = {f"{r.plate} - {r.driver} ({r.phone})": r.id for r in ambs.itertuples()}
                     chosen_display = st.selectbox("Choose ambulance", ["(choose)"] + list(amb_display_map.keys()))
+                    caller = st.text_input("Caller name (optional)")
+                    caller_phone = st.text_input("Caller phone (optional)")
+                    reason = st.text_input("Reason / notes (optional)")
                     if chosen_display and chosen_display != "(choose)":
                         if st.button("Dispatch to chosen ambulance"):
                             ambulance_id = amb_display_map[chosen_display]
-                            # update request and ambulance status
-                            update_request_db_ambulance(sel_req_id, ambulance_id, "Dispatched")
-                            set_ambulance_status_db(ambulance_id, "busy")
-                            st.success(f"Dispatched {row['patient_name']} -> {chosen_display}")
+                            # create dispatch + update
+                            did = assign_vehicle_and_create_dispatch(sel_req_id, ambulance_id, caller=caller, caller_phone=caller_phone, reason=reason)
+                            st.success(f"Dispatched {row['patient_name']} -> {chosen_display} (Dispatch ID: {did})")
                             st.experimental_rerun()
             elif row["status"] == "Dispatched":
                 st.info("This request is already dispatched.")
@@ -374,10 +508,99 @@ elif menu == "Dispatch Board":
                     if pd.notna(row["ambulance_id"]):
                         set_ambulance_status_db(row["ambulance_id"], "available")
                     update_request_db_ambulance(sel_req_id, None, "Completed")
+                    # also find dispatch log(s) for this request and mark completed
+                    c = conn.cursor()
+                    logs = c.execute("SELECT id FROM dispatch_logs WHERE request_id=? ORDER BY created_at DESC", (sel_req_id,)).fetchall()
+                    if logs:
+                        update_dispatch_status(logs[0][0], "Completed")
                     st.success("Marked Completed")
                     st.experimental_rerun()
             elif row["status"] == "Completed":
                 st.success("Request already completed.")
+
+    st.markdown("---")
+    st.subheader("Quick Dispatch Status Update (by Dispatch ID)")
+    dispatches = list_dispatches_df()
+    if dispatches.empty:
+        st.info("No dispatch logs yet.")
+    else:
+        sel_disp = st.selectbox("Select dispatch ID", ["(choose)"] + dispatches['id'].tolist())
+        if sel_disp and sel_disp != "(choose)":
+            drow = dispatches[dispatches['id']==sel_disp].iloc[0]
+            st.write(f"Dispatch for: **{drow.get('request_reason') or drow.get('request_id')}** • Status: **{drow['status']}**")
+            new_status = st.selectbox("Update status to", ["Requested", "Dispatched", "En route", "At scene", "Completed"]) 
+            if st.button("Update dispatch status"):
+                update_dispatch_status(sel_disp, new_status)
+                # if Completed and vehicle set -> free vehicle
+                if new_status == "Completed" and pd.notna(drow.get('vehicle_id')):
+                    set_ambulance_status_db(drow['vehicle_id'], 'available')
+                st.success("Dispatch status updated")
+                st.experimental_rerun()
+
+# ---------- DISPATCH LOG (History / Filters / Export / Analytics) ----------
+elif menu == "Dispatch Log":
+    st.header("Dispatch Log — history, filtering, analytics and export")
+    dispatches = list_dispatches_df()
+
+    # Filters
+    st.sidebar.header("Dispatch Log filters")
+    date_min = st.sidebar.date_input("From", value=(datetime.date.today() - datetime.timedelta(days=30)))
+    date_max = st.sidebar.date_input("To", value=datetime.date.today())
+    vehicle_filter = st.sidebar.selectbox("Vehicle (plate)", options=["All"] + sorted(dispatches['vehicle_plate'].dropna().unique().tolist()) if not dispatches.empty else ["All"])
+    status_filter = st.sidebar.selectbox("Status", options=["All"] + sorted(dispatches['status'].dropna().unique().tolist()) if not dispatches.empty else ["All"]) 
+
+    if not dispatches.empty:
+        dispatches['requested_at'] = pd.to_datetime(dispatches['requested_at'], errors='coerce')
+        mask = (dispatches['requested_at'].dt.date >= date_min) & (dispatches['requested_at'].dt.date <= date_max)
+        df_filtered = dispatches[mask]
+        if vehicle_filter != "All":
+            df_filtered = df_filtered[df_filtered['vehicle_plate']==vehicle_filter]
+        if status_filter != "All":
+            df_filtered = df_filtered[df_filtered['status']==status_filter]
+
+        st.subheader("Filtered dispatch logs")
+        st.dataframe(df_filtered, use_container_width=True)
+
+        # Export options
+        st.markdown("---")
+        st.subheader("Export / Download")
+        col1, col2 = st.columns(2)
+        with col1:
+            csv = df_filtered.to_csv(index=False)
+            st.download_button("Download CSV", data=csv, file_name=f"dispatch_logs_{date_min}_{date_max}.csv", mime='text/csv')
+        with col2:
+            # Excel
+            towrite = io.BytesIO()
+            try:
+                with pd.ExcelWriter(towrite, engine='xlsxwriter') as writer:
+                    df_filtered.to_excel(writer, index=False, sheet_name='dispatch_logs')
+                    writer.save()
+                towrite.seek(0)
+                st.download_button("Download Excel", data=towrite, file_name=f"dispatch_logs_{date_min}_{date_max}.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            except Exception:
+                # fallback to csv if excel writer not available
+                st.warning("Excel export failed in this environment — using CSV instead.")
+                st.download_button("Download CSV (fallback)", data=csv, file_name=f"dispatch_logs_{date_min}_{date_max}.csv", mime='text/csv')
+
+        # Analytics
+        st.markdown("---")
+        st.subheader("Analytics & Utilization")
+        kpis = compute_response_time_kpis(df_filtered)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Avg response (s)", kpis.get('average_response_seconds') or "N/A")
+        col2.metric("Median response (s)", kpis.get('median_response_seconds') or "N/A")
+        col3.metric("Completed dispatches", kpis.get('completed_count'))
+
+        st.subheader("Utilization - trips per vehicle & avg response")
+        start_ts = pd.to_datetime(date_min)
+        end_ts = pd.to_datetime(date_max) + pd.Timedelta(days=1)
+        util = utilization_metrics(dispatches, period_start=start_ts, period_end=end_ts)
+        if util.empty:
+            st.info("No trips in selected period.")
+        else:
+            st.dataframe(util, use_container_width=True)
+    else:
+        st.info("No dispatch logs available yet.")
 
 # ---------- AMBULANCE DASHBOARD ----------
 elif menu == "Ambulance Dashboard":
@@ -433,13 +656,21 @@ elif menu == "About":
     - Loads a trained Decision Tree model and label encoders (expected .pkl files in the folder).
     - Accepts both known (encoder) categories and new free-text values for incoming patients.
     - If incoming categorical values are unseen the app falls back to 'Unknown Priority' so requests are still accepted.
-    - Persists ambulances & requests in a local SQLite DB (dispatch.db) so data survives restarts.
+    - Persists ambulances, requests and dispatch logs in a local SQLite DB (dispatch.db) so data survives restarts.
     - Lets you assign specific ambulance + driver (with phone) to each request and click-to-call the driver.
+
+    New features added in this updated version:
+    - Centralized dispatch log (caller, location, reason, assigned vehicle and timestamps for each stage).
+    - Status-based vehicle tracking with granular statuses: Requested → Dispatched → En route → At scene → Completed.
+    - Automatic computation of response-time KPIs and simple utilization metrics (trips per vehicle, avg response time).
+    - History filtering by date range, vehicle and status for audits and analysis.
+    - Export dispatch summaries as CSV or Excel for offline reporting.
     """)
 
 # ---------------------------
 # End
 # ---------------------------
+
 
     
 

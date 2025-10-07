@@ -621,7 +621,8 @@ elif menu == "Ambulance Dashboard":
             else:
                 add_ambulance_db(plate.strip(), driver.strip(), phone.strip())
                 st.success("Ambulance added")
-                st.experimental_rerun()
+                st.rerun()
+
 
     st.markdown("---")
     st.subheader("Manage ambulances")

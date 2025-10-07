@@ -13,7 +13,8 @@ import io
 # ---------------------------
 # CONFIG / DB
 # ---------------------------
-DB_PATH = "dispatch.db"
+# NOTE: using the DB filename you provided
+DB_PATH = "dispatch_kcrh.py"
 MODEL_FILE = "DecisionTree_model.pkl"
 # Encoder file names expected (adjust if your files are named differently)
 ENCODERS = {
@@ -27,12 +28,21 @@ ENCODERS = {
 }
 
 # ---------------------------
-# DB INITIALIZATION
+# DB INITIALIZATION & SCHEMA SAFETY
 # ---------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
+
+conn = init_db()
+
+def ensure_table_and_columns():
+    """
+    Ensures the necessary tables and columns exist.
+    This helps when an existing DB lacks the new columns we've added over time.
+    """
     c = conn.cursor()
-    # ambulances table
+    # ambulances table (base)
     c.execute("""
         CREATE TABLE IF NOT EXISTS ambulances (
             id TEXT PRIMARY KEY,
@@ -42,7 +52,25 @@ def init_db():
             status TEXT
         )
     """)
-    # requests table
+    # add optional columns for live location (text) and coordinates (lat/lon) if missing
+    existing = [r[1] for r in c.execute("PRAGMA table_info('ambulances')").fetchall()]
+    if "current_location" not in existing:
+        try:
+            c.execute("ALTER TABLE ambulances ADD COLUMN current_location TEXT")
+        except Exception:
+            pass
+    if "latitude" not in existing:
+        try:
+            c.execute("ALTER TABLE ambulances ADD COLUMN latitude REAL")
+        except Exception:
+            pass
+    if "longitude" not in existing:
+        try:
+            c.execute("ALTER TABLE ambulances ADD COLUMN longitude REAL")
+        except Exception:
+            pass
+
+    # requests table (base)
     c.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id TEXT PRIMARY KEY,
@@ -62,7 +90,7 @@ def init_db():
             FOREIGN KEY(ambulance_id) REFERENCES ambulances(id)
         )
     """)
-    # dispatch_logs table (centralized dispatch log) - added dispatch_location (text-only)
+    # dispatch_logs table (centralized dispatch log) with columns we need
     c.execute("""
         CREATE TABLE IF NOT EXISTS dispatch_logs (
             id TEXT PRIMARY KEY,
@@ -73,6 +101,9 @@ def init_db():
             dispatch_location TEXT,
             request_id TEXT,
             vehicle_id TEXT,
+            ambulance_plate TEXT,
+            driver_name TEXT,
+            driver_phone TEXT,
             status TEXT,
             requested_at TEXT,
             dispatched_at TEXT,
@@ -85,10 +116,20 @@ def init_db():
             FOREIGN KEY(request_id) REFERENCES requests(id)
         )
     """)
-    conn.commit()
-    return conn
+    # ensure any newly introduced columns exist (for older DBs)
+    dispatch_cols = [r[1] for r in c.execute("PRAGMA table_info('dispatch_logs')").fetchall()]
+    needed = ["dispatch_location", "ambulance_plate", "driver_name", "driver_phone"]
+    for col in needed:
+        if col not in dispatch_cols:
+            try:
+                c.execute(f"ALTER TABLE dispatch_logs ADD COLUMN {col} TEXT")
+            except Exception:
+                pass
 
-conn = init_db()
+    conn.commit()
+
+# Run schema safety once at startup
+ensure_table_and_columns()
 
 # ---------------------------
 # Load ML model + encoders
@@ -145,7 +186,7 @@ def predict_priority(input_data: dict) -> str:
     """
     try:
         # convert visit date to timestamp
-        visit_dt = pd.to_datetime(input_data["Visit date"]) 
+        visit_dt = pd.to_datetime(input_data["Visit date"])
         ts = visit_dt.timestamp()
 
         g = safe_encode(label_encoders["Gender"], input_data["Gender"])
@@ -171,17 +212,24 @@ def predict_priority(input_data: dict) -> str:
 # ---------------------------
 # Persistence helpers
 # ---------------------------
-def add_ambulance_db(plate: str, driver: str, phone: str, status: str = "available"):
+def add_ambulance_db(plate: str, driver: str, phone: str, status: str = "available", current_location: str = None, latitude: Optional[float]=None, longitude: Optional[float]=None):
     aid = str(uuid.uuid4())
     c = conn.cursor()
-    c.execute("INSERT INTO ambulances (id, plate, driver, phone, status) VALUES (?, ?, ?, ?, ?)",
-              (aid, plate, driver, phone, status))
+    c.execute("INSERT INTO ambulances (id, plate, driver, phone, status, current_location, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              (aid, plate, driver, phone, status, current_location, latitude, longitude))
     conn.commit()
     return aid
 
-def update_ambulance_db(aid: str, plate: str, driver: str, phone: str, status: str):
+def update_ambulance_db(aid: str, plate: str, driver: str, phone: str, status: str, current_location: Optional[str]=None, latitude: Optional[float]=None, longitude: Optional[float]=None):
     c = conn.cursor()
+    # Update only provided columns to avoid overwriting nulls unintentionally
     c.execute("UPDATE ambulances SET plate=?, driver=?, phone=?, status=? WHERE id=?", (plate, driver, phone, status, aid))
+    if current_location is not None:
+        c.execute("UPDATE ambulances SET current_location=? WHERE id=?", (current_location, aid))
+    if latitude is not None:
+        c.execute("UPDATE ambulances SET latitude=? WHERE id=?", (latitude, aid))
+    if longitude is not None:
+        c.execute("UPDATE ambulances SET longitude=? WHERE id=?", (longitude, aid))
     conn.commit()
 
 def delete_ambulance_db(aid: str):
@@ -225,18 +273,21 @@ def list_requests_df():
 
 # Dispatch log helpers
 def add_dispatch_log(caller: str, caller_phone: str, request_location: str, request_reason: str,
-                     dispatch_location: str, request_id: Optional[str], vehicle_id: Optional[str], status: str = "Requested"):
-    """Insert a dispatch log including text-only dispatch_location."""
+                     dispatch_location: str, request_id: Optional[str], vehicle_id: Optional[str],
+                     ambulance_plate: Optional[str]=None, driver_name: Optional[str]=None, driver_phone: Optional[str]=None,
+                     status: str = "Requested"):
+    """Insert a dispatch log including text-only dispatch_location and vehicle info."""
     did = str(uuid.uuid4())
     now = datetime.datetime.now().isoformat()
     requested_at = now
     c = conn.cursor()
     c.execute("""
         INSERT INTO dispatch_logs (id, caller, caller_phone, request_location, request_reason,
-                                   dispatch_location, request_id, vehicle_id, status, requested_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   dispatch_location, request_id, vehicle_id, ambulance_plate, driver_name, driver_phone,
+                                   status, requested_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (did, caller, caller_phone, request_location, request_reason, dispatch_location,
-          request_id, vehicle_id, status, requested_at, now))
+          request_id, vehicle_id, ambulance_plate, driver_name, driver_phone, status, requested_at, now))
     conn.commit()
     return did
 
@@ -276,9 +327,21 @@ def assign_vehicle_and_create_dispatch(request_id: str, vehicle_id: str, caller:
     # update request and ambulance
     update_request_db_ambulance(request_id, vehicle_id, "Dispatched")
     set_ambulance_status_db(vehicle_id, "busy")
-    # create dispatch log linking to request (stores dispatch_location)
+    # fetch ambulance details for logging
+    amb_df = list_ambulances_df()
+    amb_row = amb_df[amb_df["id"] == vehicle_id]
+    if not amb_row.empty:
+        plate = amb_row.iloc[0]["plate"]
+        driver = amb_row.iloc[0]["driver"]
+        phone = amb_row.iloc[0].get("phone", "")
+    else:
+        plate = None
+        driver = None
+        phone = None
+    # create dispatch log linking to request (stores dispatch_location and ambulance details)
     did = add_dispatch_log(caller, caller_phone, request_location="", request_reason=reason,
-                           dispatch_location=dispatch_location, request_id=request_id, vehicle_id=vehicle_id, status="Dispatched")
+                           dispatch_location=dispatch_location, request_id=request_id, vehicle_id=vehicle_id,
+                           ambulance_plate=plate, driver_name=driver, driver_phone=phone, status="Dispatched")
     # set dispatched_at immediately
     update_dispatch_status(did, "Dispatched")
     return did
@@ -330,7 +393,7 @@ def utilization_metrics(dispatches: pd.DataFrame, period_start: Optional[pd.Time
 st.set_page_config(page_title="Intelligent Dispatch Dashboard", layout="wide", page_icon="🚑")
 st.title("🚑 Intelligent Dispatch Dashboard")
 
-menu = st.sidebar.radio("Menu", ["Home", "Incoming Request", "Dispatch Board", "Ambulance Dashboard", "Dispatch Log", "About"])
+menu = st.sidebar.radio("Menu", ["Home", "Incoming Request", "Dispatch Board", "Driver Updates", "Driver Location Tracker", "Ambulance Dashboard", "Dispatch Log", "About"])
 
 # ---------- HOME ----------
 if menu == "Home":
@@ -359,6 +422,15 @@ if menu == "Home":
     k2.metric("Median response (s)", kpis.get('median_response_seconds') or "N/A")
     k3.metric("Completed dispatches", kpis.get('completed_count'))
     k4.metric("Pending dispatches", kpis.get('pending_count'))
+
+    # show recent completed notifications
+    st.markdown("---")
+    st.subheader("Recent completed dispatches (notifications)")
+    recent_completed = disp_df[disp_df['status'] == 'Completed'].head(10)
+    if not recent_completed.empty:
+        st.dataframe(recent_completed[['id','ambulance_plate','driver_name','dispatch_location','request_reason','completed_at']], use_container_width=True)
+    else:
+        st.write("No completed dispatches yet.")
 
 # ---------- INCOMING REQUEST ----------
 elif menu == "Incoming Request":
@@ -547,6 +619,93 @@ elif menu == "Dispatch Board":
                 st.success("Dispatch status updated")
                 st.rerun()
 
+# ---------- DRIVER UPDATES ----------
+elif menu == "Driver Updates":
+    st.header("Driver Updates — mark trips completed")
+
+    ambs = list_ambulances_df()
+    if ambs.empty:
+        st.info("No ambulances registered yet.")
+    else:
+        # driver selects their ambulance by plate (or dispatcher picks)
+        plate_options = ambs['plate'].fillna("").tolist()
+        plate_choice = st.selectbox("Select ambulance (plate)", ["(choose)"] + plate_options)
+        if plate_choice and plate_choice != "(choose)":
+            sel = ambs[ambs['plate'] == plate_choice].iloc[0]
+            st.write(f"Driver: **{sel['driver']}**  •  Phone: **{sel.get('phone','')}**  •  Status: **{sel.get('status','')}**")
+            # show assigned dispatches for this vehicle
+            dispatches = list_dispatches_df()
+            vehicle_dispatches = dispatches[dispatches['vehicle_plate'] == plate_choice]
+            active = vehicle_dispatches[vehicle_dispatches['status'].isin(['Dispatched', 'En route'])]
+            if active.empty:
+                st.info("No active dispatches for this ambulance.")
+            else:
+                st.subheader("Active dispatches")
+                for _, d in active.iterrows():
+                    st.markdown(f"**Dispatch ID:** {d['id']}  •  Location: {d.get('dispatch_location','')}  •  Status: {d['status']}")
+                    if st.button(f"✅ Mark {d['id']} Completed", key=f"complete_{d['id']}"):
+                        # mark completed: update dispatch log, free ambulance, update request
+                        update_dispatch_status(d['id'], "Completed")
+                        if pd.notna(d.get('vehicle_id')):
+                            set_ambulance_status_db(d['vehicle_id'], "available")
+                        # also set request status to Completed
+                        if pd.notna(d.get('request_id')):
+                            update_request_db_ambulance(d['request_id'], None, "Completed")
+                        st.success(f"Dispatch {d['id']} marked completed. Dispatcher notified.")
+                        st.rerun()
+
+# ---------- DRIVER LOCATION TRACKER ----------
+elif menu == "Driver Location Tracker":
+    st.header("Driver Location Tracker")
+
+    ambs = list_ambulances_df()
+    if ambs.empty:
+        st.info("No ambulances registered yet.")
+    else:
+        st.subheader("Update your current location (drivers)")
+        plate_options = ambs['plate'].fillna("").tolist()
+        plate_choice = st.selectbox("Select your ambulance (plate)", ["(choose)"] + plate_options)
+        if plate_choice and plate_choice != "(choose)":
+            sel_row = ambs[ambs['plate'] == plate_choice].iloc[0]
+            st.write(f"Driver: **{sel_row['driver']}**  •  Phone: **{sel_row.get('phone','')}**")
+            location_text = st.text_input("Current location (text, e.g., 'Ahero', 'Kondele')", value=sel_row.get('current_location') or "")
+            col1, col2 = st.columns(2)
+            with col1:
+                lat_val = st.text_input("Latitude (optional)", value=str(sel_row.get('latitude') or ""))
+            with col2:
+                lon_val = st.text_input("Longitude (optional)", value=str(sel_row.get('longitude') or ""))
+            if st.button("Submit location update"):
+                # parse lat/lon if provided
+                lat = None
+                lon = None
+                try:
+                    if lat_val.strip() != "":
+                        lat = float(lat_val)
+                    if lon_val.strip() != "":
+                        lon = float(lon_val)
+                except Exception:
+                    st.warning("Latitude/Longitude must be numeric or left blank.")
+                update_ambulance_db(sel_row['id'], sel_row['plate'], sel_row['driver'], sel_row.get('phone',''), sel_row.get('status','available'), current_location=location_text, latitude=lat, longitude=lon)
+                st.success("Location updated.")
+                st.rerun()
+
+        st.markdown("---")
+        st.subheader("Live driver locations (dispatcher view)")
+        ambs = list_ambulances_df()
+        # show table with current_location and coords
+        cols_to_show = [c for c in ["plate","driver","phone","status","current_location","latitude","longitude"] if c in ambs.columns]
+        st.dataframe(ambs[cols_to_show], use_container_width=True)
+
+        # Show map if any ambulances have valid coordinates
+        coords = ambs.dropna(subset=['latitude','longitude']) if 'latitude' in ambs.columns and 'longitude' in ambs.columns else pd.DataFrame()
+        if not coords.empty:
+            # build dataframe for st.map (lat, lon)
+            map_df = coords[['latitude','longitude']].rename(columns={'latitude':'lat','longitude':'lon'})
+            # attach small hover info - Streamlit's st.map doesn't support hover, so show table with details above
+            st.map(map_df)
+        else:
+            st.info("No valid latitude/longitude coordinates available. Provide lat/lon when updating location to see map pins.")
+
 # ---------- DISPATCH LOG (History / Filters / Export / Analytics) ----------
 elif menu == "Dispatch Log":
     st.header("Dispatch Log — history, filtering, analytics and export")
@@ -569,8 +728,8 @@ elif menu == "Dispatch Log":
             df_filtered = df_filtered[df_filtered['status']==status_filter]
 
         st.subheader("Filtered dispatch logs")
-        # show key columns including dispatch_location
-        show_cols = ["id","vehicle_plate","vehicle_driver","dispatch_location","request_reason","status","requested_at","dispatched_at","completed_at"]
+        # show key columns including dispatch_location and ambulance/driver details
+        show_cols = ["id","vehicle_plate","ambulance_plate","driver_name","driver_phone","dispatch_location","request_reason","status","requested_at","dispatched_at","completed_at"]
         available_cols = [c for c in show_cols if c in df_filtered.columns]
         st.dataframe(df_filtered[available_cols], use_container_width=True)
 
@@ -653,8 +812,22 @@ elif menu == "Ambulance Dashboard":
             with col2:
                 phone_new = st.text_input("Phone", r["phone"])
                 status_new = st.selectbox("Status", ["available", "busy"], index=0 if r["status"] == "available" else 1)
+            # optional fields
+            loc_new = st.text_input("Current location (optional)", value=r.get("current_location") or "")
+            lat_new = st.text_input("Latitude (optional)", value=str(r.get("latitude') or '') if 'latitude' in r.index else "")
+            lon_new = st.text_input("Longitude (optional)", value=str(r.get("longitude') or '') if 'longitude' in r.index else "")
             if st.button("Update ambulance"):
-                update_ambulance_db(selected_amb, plate_new, driver_new, phone_new, status_new)
+                # attempt to parse coords
+                lat_val = None
+                lon_val = None
+                try:
+                    if lat_new.strip() != "":
+                        lat_val = float(lat_new)
+                    if lon_new.strip() != "":
+                        lon_val = float(lon_new)
+                except Exception:
+                    st.warning("Latitude/Longitude must be numeric or left blank.")
+                update_ambulance_db(selected_amb, plate_new, driver_new, phone_new, status_new, current_location=loc_new, latitude=lat_val, longitude=lon_val)
                 st.success("Ambulance updated")
                 st.rerun()
             if st.button("Delete ambulance"):
@@ -670,16 +843,15 @@ elif menu == "About":
     - Loads a trained Decision Tree model and label encoders (expected .pkl files in the folder).
     - Accepts both known (encoder) categories and new free-text values for incoming patients.
     - If incoming categorical values are unseen the app falls back to 'Unknown Priority' so requests are still accepted.
-    - Persists ambulances, requests and dispatch logs in a local SQLite DB (dispatch.db) so data survives restarts.
+    - Persists ambulances, requests and dispatch logs in a local SQLite DB so data survives restarts.
     - Lets you assign specific ambulance + driver (with phone) to each request and click-to-call the driver.
 
-    New features added in this updated version:
-    - Centralized dispatch log (caller, location, reason, assigned vehicle and timestamps for each stage).
-    - Status-based vehicle tracking with granular statuses: Requested → Dispatched → En route → At scene → Completed.
-    - Automatic computation of response-time KPIs and simple utilization metrics (trips per vehicle, avg response time).
-    - History filtering by date range, vehicle and status for audits and analysis.
-    - Export dispatch summaries as CSV or Excel for offline reporting.
-    - **Dispatch location (text-only)**: record textual dispatch place (e.g., 'Ahero', 'Kisumu Central') for each dispatch.
+    New features in this version:
+    - Dispatch location (text-only) is saved for each dispatch.
+    - Dispatcher & driver features: drivers can mark trips complete (Driver Updates tab).
+    - Driver Location Tracker: drivers update current location (text + optional lat/lon). Dispatcher sees a table and map when coordinates exist.
+    - Dispatch logs include ambulance plate, driver name and phone at time of dispatch.
+    - Schema safety: app auto-adds missing columns (so older DBs don't break).
     """)
 
 # ---------------------------

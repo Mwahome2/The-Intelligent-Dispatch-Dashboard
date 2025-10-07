@@ -814,8 +814,9 @@ elif menu == "Ambulance Dashboard":
                 status_new = st.selectbox("Status", ["available", "busy"], index=0 if r["status"] == "available" else 1)
             # optional fields
             loc_new = st.text_input("Current location (optional)", value=r.get("current_location") or "")
-            lat_new = st.text_input("Latitude (optional)", value=str(r.get("latitude') or '') if 'latitude' in r.index else "")
-            lon_new = st.text_input("Longitude (optional)", value=str(r.get("longitude') or '') if 'longitude' in r.index else "")
+            lat_new = st.text_input("Latitude (optional)", value=str(r.get("latitude") or '') if 'latitude' in r.index else "")
+            lon_new = st.text_input("Longitude (optional)", value=str(r.get("longitude") or '') if 'longitude' in r.index else "")
+
             if st.button("Update ambulance"):
                 # attempt to parse coords
                 lat_val = None
